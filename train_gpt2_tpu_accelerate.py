@@ -29,7 +29,7 @@ SEED = 1337
 
 # 训练 batch 配置
 TOTAL_BATCH_SIZE = 524288   # 全局 token batch
-MICRO_BATCH_SIZE = 64       # 每个进程每次 forward 的 batch size，根据显存大小调整
+MICRO_BATCH_SIZE = 16       # 每个进程每次 forward 的 batch size，根据显存大小调整
 SEQ_LEN = 1024
 
 # 模型配置
@@ -62,7 +62,10 @@ SAMPLE_INTERVAL = 500
 SAMPLE_NUM_RETURN_SEQS = 4
 SAMPLE_MAX_LENGTH = 32
 SAMPLE_TOPK = 50
-SAMPLE_PROMPT = "Hello, I'm a language model,"
+SAMPLE_PROMPTS = [
+    "Hello, I'm a language model,",
+    "I'm a computer science student,",
+]
 
 # TPU / Accelerate
 TPU_NUM_PROCESSES = 8
@@ -396,29 +399,35 @@ def evaluate(model, val_loader, accelerator, val_steps, use_xla_sync=False):
 def generate_samples(model, enc, accelerator, step):
     model.eval()
 
-    tokens = enc.encode(SAMPLE_PROMPT)
-    xgen = torch.tensor(tokens, dtype=torch.long, device=accelerator.device).unsqueeze(0)
-    xgen = xgen.repeat(SAMPLE_NUM_RETURN_SEQS, 1)
-
     sample_gen = torch.Generator(device=accelerator.device)
     sample_gen.manual_seed(42)
 
-    while xgen.size(1) < SAMPLE_MAX_LENGTH:
-        with accelerator.autocast():
-            logits, _ = model(xgen)
-
-        logits = logits[:, -1, :]
-        probs = F.softmax(logits, dim=-1)
-        topk_probs, topk_indices = torch.topk(probs, SAMPLE_TOPK, dim=-1)
-        ix = torch.multinomial(topk_probs, 1, generator=sample_gen)
-        xcol = torch.gather(topk_indices, -1, ix)
-        xgen = torch.cat((xgen, xcol), dim=1)
-
     if accelerator.process_index == 0:
         print(f"\n===== sample @ step {step} =====", flush=True)
-        for i in range(SAMPLE_NUM_RETURN_SEQS):
-            out = enc.decode(xgen[i].tolist())
-            print(f"sample {i}: {out}", flush=True)
+
+    for prompt in SAMPLE_PROMPTS:
+        tokens = enc.encode(prompt)
+        xgen = torch.tensor(tokens, dtype=torch.long, device=accelerator.device).unsqueeze(0)
+        xgen = xgen.repeat(SAMPLE_NUM_RETURN_SEQS, 1)
+
+        while xgen.size(1) < SAMPLE_MAX_LENGTH:
+            with accelerator.autocast():
+                logits, _ = model(xgen)
+
+            logits = logits[:, -1, :]
+            probs = F.softmax(logits, dim=-1)
+            topk_probs, topk_indices = torch.topk(probs, SAMPLE_TOPK, dim=-1)
+            ix = torch.multinomial(topk_probs, 1, generator=sample_gen)
+            xcol = torch.gather(topk_indices, -1, ix)
+            xgen = torch.cat((xgen, xcol), dim=1)
+
+        if accelerator.process_index == 0:
+            print(f"\n[prompt] {prompt}", flush=True)
+            for i in range(SAMPLE_NUM_RETURN_SEQS):
+                out = enc.decode(xgen[i].tolist())
+                print(f"  sample {i}: {out}", flush=True)
+
+    if accelerator.process_index == 0:
         print("================================\n", flush=True)
 
     model.train()
