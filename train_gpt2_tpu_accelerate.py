@@ -1,4 +1,8 @@
 import os
+# TPU memory optimizations
+os.environ['XLA_TENSOR_ALLOCATOR_MAXSIZE'] = '100000000'
+os.environ['XLA_USE_BF16'] = '1'
+
 import math
 import time
 import inspect
@@ -29,7 +33,7 @@ SEED = 1337
 
 # 训练 batch 配置
 TOTAL_BATCH_SIZE = 524288   # 全局 token batch
-MICRO_BATCH_SIZE = 16       # 每个进程每次 forward 的 batch size，根据显存大小调整
+MICRO_BATCH_SIZE = 4       # 调小以避免 TPU HBM 溢出
 SEQ_LEN = 1024
 
 # 模型配置
@@ -106,18 +110,6 @@ def get_lr(step: int) -> float:
     decay_ratio = min(max(decay_ratio, 0.0), 1.0)
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
     return MIN_LR + coeff * (MAX_LR - MIN_LR)
-
-
-def tree_to_cpu(obj):
-    if torch.is_tensor(obj):
-        return obj.detach().cpu()
-    if isinstance(obj, dict):
-        return {k: tree_to_cpu(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [tree_to_cpu(v) for v in obj]
-    if isinstance(obj, tuple):
-        return tuple(tree_to_cpu(v) for v in obj)
-    return obj
 
 
 def ensure_dir(path):
@@ -296,6 +288,7 @@ class GPT(nn.Module):
     def __init__(self, config: GPTConfig):
         super().__init__()
         self.config = config
+        self.gradient_checkpointing = False
 
         self.transformer = nn.ModuleDict({
             "wte": nn.Embedding(config.vocab_size, config.n_embd),
@@ -328,8 +321,20 @@ class GPT(nn.Module):
         pos_emb = self.transformer.wpe(pos)
         x = tok_emb + pos_emb
 
+        try:
+            from torch_xla.utils.checkpoint import checkpoint as xla_checkpoint
+            HAS_XLA_CHECKPOINT = True
+        except ImportError:
+            HAS_XLA_CHECKPOINT = False
+
         for block in self.transformer.h:
-            x = block(x)
+            if self.gradient_checkpointing and self.training:
+                if x.device.type == "xla" and HAS_XLA_CHECKPOINT:
+                    x = xla_checkpoint(block, x)
+                else:
+                    x = torch.utils.checkpoint.checkpoint(block, x, use_reentrant=False)
+            else:
+                x = block(x)
 
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x)
@@ -390,9 +395,10 @@ def evaluate(model, val_loader, accelerator, val_steps, use_xla_sync=False):
 
         losses.append(loss.detach())
 
-        if use_xla_sync:
-            import torch_xla
-            torch_xla.sync()
+    # 只在最后同步一次
+    if use_xla_sync:
+        import torch_xla
+        torch_xla.sync()
 
     local_mean = torch.stack(losses).mean()
     global_mean = accelerator.gather(local_mean).mean().item()
@@ -452,8 +458,11 @@ def save_checkpoint(
 ):
     accelerator.wait_for_everyone()
 
+    # 🚨 终极死锁神坑修复：不要手动循环调用 .cpu() 转换 XLA 张量
+    # 直接使用 accelerator.get_state_dict() 获取模型状态
+    # 并且直接获取 optimizer.state_dict()，交由 accelerator.save 统一安全处理
     state_dict = accelerator.get_state_dict(model)
-    opt_state = tree_to_cpu(optimizer.state_dict())
+    opt_state = optimizer.state_dict()
 
     ckpt = {
         "model": state_dict,
@@ -598,6 +607,8 @@ def train_worker():
         tpu_print("initializing model from scratch")
         model = GPT(model_config)
 
+    model.gradient_checkpointing = True
+
     if USE_TORCH_COMPILE:
         tpu_print("warning: torch.compile is disabled on TPU in practice; keeping it off is recommended")
         model = torch.compile(model)
@@ -699,8 +710,8 @@ def train_worker():
         # sample
         if DO_SAMPLE and ((step > 0 and step % SAMPLE_INTERVAL == 0) or last_step):
             accelerator.wait_for_everyone()
-            if accelerator.process_index == 0:
-                generate_samples(raw_model, enc, accelerator, step)
+            # 🚨 TPU 死锁大坑修复 2：XLA 的计算图要求多卡同步。所有设备都必须参与 generate 运算进行占位，绝不能 `if rank == 0:` 单独执行
+            generate_samples(raw_model, enc, accelerator, step)
             accelerator.wait_for_everyone()
 
         # train one optimizer step
