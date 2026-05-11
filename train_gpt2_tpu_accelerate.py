@@ -80,7 +80,13 @@ USE_SDPA = False
 WANDB_ENABLED = True
 WANDB_PROJECT = "nanogpt-tpu"
 WANDB_RUN_NAME = "nanogpt-kaggle-tpuv5e-8"
-SWANLAB_API_KEY = os.environ.get("SWANLAB_API_KEY", None)
+from kaggle_secrets import UserSecretsClient
+try:
+    user_secrets = UserSecretsClient()
+    SWANLAB_API_KEY = user_secrets.get_secret("SWANLAB_API_KEY")
+except Exception as e:
+    print(f"⚠️ 提取 Kaggle Secrets 失败: {e}")
+    SWANLAB_API_KEY = None
 
 # resume
 RESUME_PATH = None  # 例如 "log_tpu/best_ckpt.pt"
