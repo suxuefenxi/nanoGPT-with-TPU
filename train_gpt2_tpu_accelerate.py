@@ -79,7 +79,7 @@ USE_TORCH_COMPILE = False  # TPU 不建议开
 
 # Attention
 # TPU 上默认走手写 causal attention，不走 flash / fused / cuda sdpa 快路径
-USE_SDPA = False
+USE_SDPA = True
 
 # wandb
 WANDB_ENABLED = True
@@ -312,10 +312,11 @@ class GPT(nn.Module):
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
-            std = 0.02
             if hasattr(module, "NANOGPT_SCALE_INIT"):
-                std *= (2 * self.config.n_layer) ** -0.5
-            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+                # 残差连接前的投影层初始化为零，初期残差流为恒等映射
+                torch.nn.init.zeros_(module.weight)
+            else:
+                torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
