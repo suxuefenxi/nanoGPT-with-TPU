@@ -1,7 +1,6 @@
 import os
 # TPU memory optimizations
 os.environ['XLA_TENSOR_ALLOCATOR_MAXSIZE'] = '100000000'
-os.environ['XLA_USE_BF16'] = '1'
 
 import math
 import time
@@ -25,7 +24,7 @@ from accelerate.utils import set_seed
 # ============================================================
 
 DATA_ROOT = "/kaggle/input/datasets/zhxlidf/edu-fineweb10b"  
-OUT_DIR = "log_tpu"
+OUT_DIR = "out"
 BEST_CKPT_NAME = "best_ckpt.pt"
 FINAL_CKPT_NAME = "final_ckpt.pt"
 
@@ -53,7 +52,8 @@ GRAD_CLIP = 1.0
 MAX_LR = 6e-4
 MIN_LR = MAX_LR * 0.1
 WARMUP_STEPS = 715
-MAX_STEPS = 19073
+MAX_STEPS = 10000        # 分次跑：第一次跑 10000 步，之后接着跑
+LR_DECAY_STEPS = 19073   # 学习率衰减目标步数，和 MAX_STEPS 解耦，保证按总步数衰减
 
 # 验证 / 保存
 VAL_INTERVAL = 500
@@ -69,11 +69,12 @@ SAMPLE_TOPK = 50
 SAMPLE_PROMPTS = [
     "Hello, I'm a language model,",
     "I'm a computer science student,",
+    "Science is cool",
 ]
 
 # TPU / Accelerate
 TPU_NUM_PROCESSES = 8
-MIXED_PRECISION = "bf16"   # "bf16" or "no"
+MIXED_PRECISION = "no"   # "bf16" or "no"
 USE_TORCH_COMPILE = False  # TPU 不建议开
 
 # Attention
@@ -93,7 +94,7 @@ except Exception as e:
     SWANLAB_API_KEY = None
 
 # resume
-RESUME_PATH = None  # 例如 "log_tpu/best_ckpt.pt"
+RESUME_PATH = None  # 例如 "out/final_ckpt.pt"
 
 
 # ============================================================
@@ -101,12 +102,13 @@ RESUME_PATH = None  # 例如 "log_tpu/best_ckpt.pt"
 # ============================================================
 
 def get_lr(step: int) -> float:
+    """学习率调度：先线性 warmup 到 MAX_LR，在 LR_DECAY_STEPS 步数内余弦衰减到 MIN_LR，之后保持 MIN_LR"""
     if step < WARMUP_STEPS:
         return MAX_LR * (step + 1) / WARMUP_STEPS
-    if step > MAX_STEPS:
+    if step > LR_DECAY_STEPS:
         return MIN_LR
 
-    decay_ratio = (step - WARMUP_STEPS) / (MAX_STEPS - WARMUP_STEPS)
+    decay_ratio = (step - WARMUP_STEPS) / (LR_DECAY_STEPS - WARMUP_STEPS)
     decay_ratio = min(max(decay_ratio, 0.0), 1.0)
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
     return MIN_LR + coeff * (MAX_LR - MIN_LR)
@@ -216,11 +218,13 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.use_sdpa = config.use_sdpa
+        self.head_dim = config.n_embd // config.n_head
+        self.scale = 1.0 / math.sqrt(self.head_dim)
 
+        mask = torch.tril(torch.ones(config.block_size, config.block_size, dtype=torch.bool))
         self.register_buffer(
-            "bias",
-            torch.tril(torch.ones(config.block_size, config.block_size))
-            .view(1, 1, config.block_size, config.block_size),
+            "causal_mask",
+            mask.view(1, 1, config.block_size, config.block_size),
             persistent=False,
         )
 
@@ -238,8 +242,13 @@ class CausalSelfAttention(nn.Module):
         if self.use_sdpa and x.device.type != "xla":
             y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         else:
-            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
+            # q 提前缩放，避免 q@k^T 数值过大
+            att = (q * self.scale) @ k.transpose(-2, -1)  # (B, nh, T, T) 
+
+            # 用 -1e4（fp32 安全的有限负数；对 softmax 而言 exp(-1e4) 已经是 0）
+            mask_slice = self.causal_mask[:, :, :T, :T]
+            att = att.masked_fill(~mask_slice, -1e4)
+
             att = F.softmax(att, dim=-1)
             y = att @ v
 
@@ -277,7 +286,7 @@ class Block(nn.Module):
 @dataclass
 class GPTConfig:
     block_size: int = 1024
-    vocab_size: int = 50257
+    vocab_size: int = 50304
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
@@ -327,6 +336,7 @@ class GPT(nn.Module):
         except ImportError:
             HAS_XLA_CHECKPOINT = False
 
+        # 使用梯度检查点（gradient checkpointing）来节省内存
         for block in self.transformer.h:
             if self.gradient_checkpointing and self.training:
                 if x.device.type == "xla" and HAS_XLA_CHECKPOINT:
@@ -411,9 +421,6 @@ def evaluate(model, val_loader, accelerator, val_steps, use_xla_sync=False):
 def generate_samples(model, enc, accelerator, step):
     model.eval()
 
-    sample_gen = torch.Generator(device=accelerator.device)
-    sample_gen.manual_seed(42)
-
     if accelerator.process_index == 0:
         print(f"\n===== sample @ step {step} =====", flush=True)
 
@@ -429,7 +436,7 @@ def generate_samples(model, enc, accelerator, step):
             logits = logits[:, -1, :]
             probs = F.softmax(logits, dim=-1)
             topk_probs, topk_indices = torch.topk(probs, SAMPLE_TOPK, dim=-1)
-            ix = torch.multinomial(topk_probs, 1, generator=sample_gen)
+            ix = torch.multinomial(topk_probs, 1)
             xcol = torch.gather(topk_indices, -1, ix)
             xgen = torch.cat((xgen, xcol), dim=1)
 
@@ -462,6 +469,21 @@ def save_checkpoint(
     # 直接使用 accelerator.get_state_dict() 获取模型状态
     # 并且直接获取 optimizer.state_dict()，交由 accelerator.save 统一安全处理
     state_dict = accelerator.get_state_dict(model)
+
+    # 🔍 诊断：检查 accelerator.get_state_dict() 返回的 key 情况
+    if accelerator.process_index == 0:
+        print(f"[save] get_state_dict 返回 {len(state_dict)} 个 keys", flush=True)
+        has_lm = 'lm_head.weight' in state_dict
+        has_wte = 'transformer.wte.weight' in state_dict
+        print(f"[save] lm_head.weight 存在: {has_lm}, wte.weight 存在: {has_wte}", flush=True)
+        if has_lm and has_wte:
+            same_ptr = state_dict['lm_head.weight'].data_ptr() == state_dict['transformer.wte.weight'].data_ptr()
+            print(f"[save] lm_head 和 wte 是同一张量: {same_ptr}", flush=True)
+            print(f"[save] lm_head.std()={state_dict['lm_head.weight'].float().std().item():.6f}, wte.std()={state_dict['transformer.wte.weight'].float().std().item():.6f}", flush=True)
+
+    # 🚨 关键修复：移除 weight tying 导致的重复 key
+    if 'lm_head.weight' in state_dict and 'transformer.wte.weight' in state_dict:
+        del state_dict['lm_head.weight']
     opt_state = optimizer.state_dict()
 
     ckpt = {
@@ -480,6 +502,7 @@ def save_checkpoint(
             "MIN_LR": MIN_LR,
             "WARMUP_STEPS": WARMUP_STEPS,
             "MAX_STEPS": MAX_STEPS,
+            "LR_DECAY_STEPS": LR_DECAY_STEPS,
             "WEIGHT_DECAY": WEIGHT_DECAY,
             "BETA1": BETA1,
             "BETA2": BETA2,
@@ -562,6 +585,7 @@ def train_worker():
                     "min_lr": MIN_LR,
                     "warmup_steps": WARMUP_STEPS,
                     "max_steps": MAX_STEPS,
+                    "lr_decay_steps": LR_DECAY_STEPS,
                     "mixed_precision": MIXED_PRECISION,
                     "use_sdpa": USE_SDPA,
                     "resume_path": RESUME_PATH,
@@ -599,7 +623,37 @@ def train_worker():
             model_config = GPTConfig(**checkpoint["model_config"])
 
         model = GPT(model_config)
-        model.load_state_dict(checkpoint["model"], strict=True)
+        state_dict = checkpoint["model"]
+
+        # 清理可能的前缀（torch.compile 会加 _orig_mod.，distributed 会加 module.）
+        unwanted_prefixes = ['_orig_mod.', 'module.']
+        for prefix in unwanted_prefixes:
+            for k in list(state_dict.keys()):
+                if k.startswith(prefix):
+                    state_dict[k[len(prefix):]] = state_dict.pop(k)
+
+        # 🚨 关键修复：处理 weight tying 导致的重复 key 问题
+        # accelerator.get_state_dict() 会破坏 weight tying，将 wte 和 lm_head 保存为独立副本。
+        # load_state_dict 按字母序加载，lm_head 在 transformer 之后，会用随机初始值覆盖训练值。
+        # 解决方案：移除 lm_head.weight，让 load_state_dict 保留 wte.weight 的训练值，
+        # 之后模型的 weight tying 自动让 lm_head.weight 指向正确的 wte.weight。
+        if 'lm_head.weight' in state_dict and 'transformer.wte.weight' in state_dict:
+            del state_dict['lm_head.weight']
+            tpu_print("🔧 已移除 lm_head.weight（weight tying：由 wte.weight 提供）")
+
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        if missing:
+            tpu_print(f"⚠️ load_state_dict 缺失的 key: {missing}")
+        if unexpected:
+            tpu_print(f"⚠️ load_state_dict 多余的 key: {unexpected}")
+
+        # 验证 weight tying 是否正确恢复
+        assert model.lm_head.weight.data_ptr() == model.transformer.wte.weight.data_ptr(), \
+            "weight tying 未正确恢复！lm_head.weight 和 wte.weight 不是同一个张量"
+
+        # 验证权重是否真的加载成功
+        first_param_name, first_param = next(model.named_parameters())
+        tpu_print(f"验证加载: {first_param_name}[:5] = {first_param.data.view(-1)[:5].tolist()}")
 
         start_step = int(checkpoint["step"])
         best_val_loss = float(checkpoint["best_val_loss"])
@@ -623,10 +677,31 @@ def train_worker():
 
     model, optimizer = accelerator.prepare(model, optimizer)
 
+    # 🔍 关键诊断：prepare() 可能破坏 weight tying
+    # 在 TPU 上，prepare() 会将参数重新创建到 XLA 设备上，
+    # 这个过程可能导致 wte.weight 和 lm_head.weight 变成独立张量。
+    raw = accelerator.unwrap_model(model)
+    wte_ptr = raw.transformer.wte.weight.data_ptr()
+    lm_ptr = raw.lm_head.weight.data_ptr()
+    tied_before = (wte_ptr == lm_ptr)
+    tpu_print(f"[诊断] prepare() 后 weight tying: {tied_before} (wte_ptr={wte_ptr}, lm_ptr={lm_ptr})")
+
+    if not tied_before:
+        tpu_print("🚨 weight tying 被 prepare() 破坏！重新绑定...")
+        raw.lm_head.weight = raw.transformer.wte.weight
+        tpu_print(f"[诊断] 重新绑定后: {raw.transformer.wte.weight.data_ptr() == raw.lm_head.weight.data_ptr()}")
+
+    # 强制 XLA 同步：确保从 CPU 加载的权重真正物化到 TPU 内存
+    if use_xla_sync:
+        import torch_xla.core.xla_model as xm
+        xm.mark_step()
+
     # optimizer 状态必须在 prepare 之后加载
     if checkpoint is not None and "optimizer" in checkpoint:
         tpu_print("loading optimizer state...")
         optimizer.load_state_dict(checkpoint["optimizer"])
+        if use_xla_sync:
+            xm.mark_step()
 
     # -------------------------
     # Data
@@ -733,7 +808,7 @@ def train_worker():
                 _, loss = model(x, y)
 
             loss_accum += loss.detach() / grad_accum_steps
-            accelerator.backward(loss / grad_accum_steps)
+            accelerator.backward(loss / grad_accum_steps)  
 
         grad_norm = None
         if GRAD_CLIP is not None and GRAD_CLIP > 0:
