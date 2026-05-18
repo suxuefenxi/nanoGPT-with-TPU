@@ -206,6 +206,13 @@ class StatefulShardLoader:
 # Model
 # ============================================================
 
+def rotate_half(x):
+    """将向量前半和后半交换并取反，等价于旋转 90 度"""
+    x1 = x[..., :x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2:]
+    return torch.cat([-x2, x1], dim=-1)
+
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -224,6 +231,16 @@ class CausalSelfAttention(nn.Module):
         # QK-Norm：在 head_dim 维度上归一化，防止 attention logit 爆炸
         self.q_norm = nn.LayerNorm(self.head_dim)
         self.k_norm = nn.LayerNorm(self.head_dim)
+
+        # RoPE：预计算 cos/sin 缓存
+        freqs = 1.0 / (10000 ** (torch.arange(0, self.head_dim, 2) / self.head_dim))
+        positions = torch.arange(config.block_size)
+        angles = positions.unsqueeze(1) * freqs.unsqueeze(0)  # (block_size, head_dim/2)
+        cos = angles.cos()
+        sin = angles.sin()
+        # 扩展到 head_dim 维度（前后半相同）
+        self.register_buffer("cos_cached", torch.cat([cos, cos], dim=-1))  # (block_size, head_dim)
+        self.register_buffer("sin_cached", torch.cat([sin, sin], dim=-1))  # (block_size, head_dim)
 
         mask = torch.tril(torch.ones(config.block_size, config.block_size, dtype=torch.bool))
         self.register_buffer(
@@ -246,6 +263,12 @@ class CausalSelfAttention(nn.Module):
         # QK-Norm
         q = self.q_norm(q)
         k = self.k_norm(k)
+
+        # RoPE：对 Q 和 K 施加旋转位置编码
+        cos = self.cos_cached[:T].unsqueeze(0).unsqueeze(0)  # (1, 1, T, head_dim)
+        sin = self.sin_cached[:T].unsqueeze(0).unsqueeze(0)
+        q = q * cos + rotate_half(q) * sin
+        k = k * cos + rotate_half(k) * sin
 
         if self.use_sdpa and x.device.type != "xla":
             y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
@@ -310,7 +333,6 @@ class GPT(nn.Module):
 
         self.transformer = nn.ModuleDict({
             "wte": nn.Embedding(config.vocab_size, config.n_embd),
-            "wpe": nn.Embedding(config.block_size, config.n_embd),
             "h": nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             "ln_f": nn.LayerNorm(config.n_embd),
         })
@@ -335,10 +357,8 @@ class GPT(nn.Module):
         B, T = idx.size()
         assert T <= self.config.block_size, f"T={T} > block_size={self.config.block_size}"
 
-        pos = torch.arange(0, T, dtype=torch.long, device=idx.device)
         tok_emb = self.transformer.wte(idx)
-        pos_emb = self.transformer.wpe(pos)
-        x = tok_emb + pos_emb
+        x = tok_emb
 
         try:
             from torch_xla.utils.checkpoint import checkpoint as xla_checkpoint
