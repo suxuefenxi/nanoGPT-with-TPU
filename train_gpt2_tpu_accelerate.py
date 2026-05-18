@@ -62,7 +62,7 @@ SAVE_BEST_ONLY_WHEN_IMPROVED = True
 
 # 采样
 DO_SAMPLE = True
-SAMPLE_INTERVAL = 500
+SAMPLE_INTERVAL = 1000
 SAMPLE_NUM_RETURN_SEQS = 4
 SAMPLE_MAX_LENGTH = 32
 SAMPLE_TOPK = 50
@@ -337,9 +337,8 @@ class GPT(nn.Module):
             "h": nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             "ln_f": nn.LayerNorm(config.n_embd),
         })
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-
-        self.transformer.wte.weight = self.lm_head.weight
+        # 不设 lm_head，forward 中直接用 F.linear(x, wte.weight)
+        # 从根本上避免 weight tying 被 accelerator.prepare() 破坏的问题
         self.apply(self._init_weights)
 
     def _init_weights(self, module):
@@ -378,7 +377,7 @@ class GPT(nn.Module):
                 x = block(x)
 
         x = self.transformer.ln_f(x.float()).to(x.dtype)
-        logits = self.lm_head(x)
+        logits = F.linear(x, self.transformer.wte.weight)
 
         loss = None
         if targets is not None:
@@ -391,12 +390,6 @@ class GPT(nn.Module):
 
     def configure_optimizers(self, weight_decay, learning_rate, betas=(0.9, 0.95), eps=1e-8, master_process=True):
         param_dict = {pn: p for pn, p in self.named_parameters() if p.requires_grad}
-
-        # weight tying：lm_head.weight 和 wte.weight 是同一张量，只让 optimizer 追踪 wte
-        # 即使 prepare() 破坏了 tying，optimizer 也只更新 wte，训练循环中手动同步到 lm_head
-        if 'lm_head.weight' in param_dict and 'transformer.wte.weight' in param_dict:
-            if param_dict['lm_head.weight'] is param_dict['transformer.wte.weight']:
-                del param_dict['lm_head.weight']
 
         decay_params = [p for _, p in param_dict.items() if p.dim() >= 2]
         nodecay_params = [p for _, p in param_dict.items() if p.dim() < 2]
@@ -508,19 +501,14 @@ def save_checkpoint(
     # 并且直接获取 optimizer.state_dict()，交由 accelerator.save 统一安全处理
     state_dict = accelerator.get_state_dict(model)
 
-    # 🔍 诊断：检查 accelerator.get_state_dict() 返回的 key 情况
+    # 诊断：检查 state_dict 情况（无 lm_head，只保留 wte）
     if accelerator.process_index == 0:
         print(f"[save] get_state_dict 返回 {len(state_dict)} 个 keys", flush=True)
-        has_lm = 'lm_head.weight' in state_dict
-        has_wte = 'transformer.wte.weight' in state_dict
-        print(f"[save] lm_head.weight 存在: {has_lm}, wte.weight 存在: {has_wte}", flush=True)
-        if has_lm and has_wte:
-            same_values = torch.equal(state_dict['lm_head.weight'], state_dict['transformer.wte.weight'])
-            print(f"[save] lm_head 和 wte 值相同: {same_values}", flush=True)
-            print(f"[save] lm_head.std()={state_dict['lm_head.weight'].float().std().item():.6f}, wte.std()={state_dict['transformer.wte.weight'].float().std().item():.6f}", flush=True)
+        if 'transformer.wte.weight' in state_dict:
+            print(f"[save] wte.std()={state_dict['transformer.wte.weight'].float().std().item():.6f}", flush=True)
 
-    # 🚨 关键修复：移除 weight tying 导致的重复 key
-    if 'lm_head.weight' in state_dict and 'transformer.wte.weight' in state_dict:
+    # 兼容旧 checkpoint：如果 state_dict 里意外出现 lm_head.weight，移除之
+    if 'lm_head.weight' in state_dict:
         del state_dict['lm_head.weight']
     opt_state = optimizer.state_dict()
 
@@ -670,14 +658,10 @@ def train_worker():
                 if k.startswith(prefix):
                     state_dict[k[len(prefix):]] = state_dict.pop(k)
 
-        # 🚨 关键修复：处理 weight tying 导致的重复 key 问题
-        # accelerator.get_state_dict() 会破坏 weight tying，将 wte 和 lm_head 保存为独立副本。
-        # load_state_dict 按字母序加载，lm_head 在 transformer 之后，会用随机初始值覆盖训练值。
-        # 解决方案：移除 lm_head.weight，让 load_state_dict 保留 wte.weight 的训练值，
-        # 之后模型的 weight tying 自动让 lm_head.weight 指向正确的 wte.weight。
-        if 'lm_head.weight' in state_dict and 'transformer.wte.weight' in state_dict:
+        # 兼容旧 checkpoint：旧版模型有 lm_head.weight，新版已移除，直接删掉
+        if 'lm_head.weight' in state_dict:
             del state_dict['lm_head.weight']
-            tpu_print("🔧 已移除 lm_head.weight（weight tying：由 wte.weight 提供）")
+            tpu_print("🔧 已移除旧 checkpoint 中的 lm_head.weight（新版用 F.linear + wte.weight）")
 
         missing, unexpected = model.load_state_dict(state_dict, strict=False)
         if missing:
@@ -690,10 +674,6 @@ def train_worker():
             if param.dtype != torch.float32:
                 tpu_print(f"⚠️ {name} dtype={param.dtype}，转为 fp32")
                 param.data = param.data.float()
-
-        # 验证 weight tying 是否正确恢复（用 torch.equal 比较实际值，data_ptr 在 XLA 上不可靠）
-        assert torch.equal(model.lm_head.weight, model.transformer.wte.weight), \
-            "weight tying 未正确恢复！lm_head.weight 和 wte.weight 值不同"
 
         # 验证权重是否真的加载成功
         first_param_name, first_param = next(model.named_parameters())
@@ -721,18 +701,7 @@ def train_worker():
 
     model, optimizer = accelerator.prepare(model, optimizer)
 
-    # 🔍 关键诊断：prepare() 可能破坏 weight tying
-    # 在 TPU 上，prepare() 会将参数重新创建到 XLA 设备上，
-    # 这个过程可能导致 wte.weight 和 lm_head.weight 变成独立张量。
-    # 注意：data_ptr() 在 XLA 上不可靠（返回 0），必须用 torch.equal 比较实际值
-    raw = accelerator.unwrap_model(model)
-    weights_tied = torch.equal(raw.transformer.wte.weight, raw.lm_head.weight)
-    tpu_print(f"[诊断] prepare() 后 weight tying: {weights_tied}")
-
-    if not weights_tied:
-        tpu_print("🚨 weight tying 被 prepare() 破坏！重新绑定 wte → lm_head...")
-        raw.lm_head.weight = raw.transformer.wte.weight
-        tpu_print(f"[诊断] 重新绑定后: {torch.equal(raw.transformer.wte.weight, raw.lm_head.weight)}")
+    # 无 lm_head，不存在 weight tying 问题，无需诊断
 
     # 强制 XLA 同步：确保从 CPU 加载的权重真正物化到 TPU 内存
     if use_xla_sync:
@@ -859,10 +828,6 @@ def train_worker():
 
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
-
-        # weight tying 同步：optimizer 只更新 wte，手动同步到 lm_head
-        # 无论 prepare() 是否破坏了 tying，这一步都保证 lm_head 和 wte 始终一致
-        raw_model.lm_head.weight = raw_model.transformer.wte.weight
 
         if use_xla_sync:
             import torch_xla
