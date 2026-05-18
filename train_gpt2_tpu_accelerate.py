@@ -45,7 +45,7 @@ N_EMBD = 768
 WEIGHT_DECAY = 0.1
 BETA1 = 0.9
 BETA2 = 0.95
-EPS = 1e-8
+EPS = 1e-6
 GRAD_CLIP = 1.0
 
 # 学习率
@@ -74,7 +74,7 @@ SAMPLE_PROMPTS = [
 
 # TPU / Accelerate
 TPU_NUM_PROCESSES = 8
-MIXED_PRECISION = "no"   # "bf16" or "no"
+MIXED_PRECISION = "bf16"   # "bf16" or "no"
 USE_TORCH_COMPILE = False  # TPU 不建议开
 
 # Attention
@@ -260,31 +260,31 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_head, head_dim).transpose(1, 2)
 
-        # QK-Norm
-        q = self.q_norm(q)
-        k = self.k_norm(k)
+        # QK-Norm（fp32 以防 bf16 方差计算 catastrophic cancellation）
+        q = self.q_norm(q.float()).to(q.dtype)
+        k = self.k_norm(k.float()).to(k.dtype)
 
-        # RoPE：对 Q 和 K 施加旋转位置编码
-        cos = self.cos_cached[:T].unsqueeze(0).unsqueeze(0)  # (1, 1, T, head_dim)
-        sin = self.sin_cached[:T].unsqueeze(0).unsqueeze(0)
+        # RoPE + Attention（全路径 fp32）
+        # q/k/v 转 fp32：RoPE 小角度精度、softmax exp 溢出都需要 fp32
+        cos = self.cos_cached[:T].unsqueeze(0).unsqueeze(0)  # (1, 1, T, head_dim) fp32
+        sin = self.sin_cached[:T].unsqueeze(0).unsqueeze(0)  # fp32
+        q = q.float()
+        k = k.float()
+        v = v.float()
         q = q * cos + rotate_half(q) * sin
         k = k * cos + rotate_half(k) * sin
 
         if self.use_sdpa and x.device.type != "xla":
             y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         else:
-            # q 提前缩放，避免 q@k^T 数值过大
-            att = (q * self.scale) @ k.transpose(-2, -1)  # (B, nh, T, T) 
-
-            # 用 -1e4（fp32 安全的有限负数；对 softmax 而言 exp(-1e4) 已经是 0）
+            att = (q * self.scale) @ k.transpose(-2, -1)  # (B, nh, T, T) fp32
             mask_slice = self.causal_mask[:, :, :T, :T]
             att = att.masked_fill(~mask_slice, -1e4)
-
             att = F.softmax(att, dim=-1)
             y = att @ v
 
         y = y.transpose(1, 2).contiguous().view(B, T, C)
-        y = self.c_proj(y)
+        y = self.c_proj(y)  # autocast 自动处理 bf16 转换
         return y
 
 
@@ -310,8 +310,9 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
+        # LayerNorm 强制 fp32，防止 bf16 下方差 catastrophic cancellation 导致 NaN
+        x = x + self.attn(self.ln_1(x.float()).to(x.dtype))
+        x = x + self.mlp(self.ln_2(x.float()).to(x.dtype))
         return x
 
 
@@ -376,13 +377,14 @@ class GPT(nn.Module):
             else:
                 x = block(x)
 
-        x = self.transformer.ln_f(x)
+        x = self.transformer.ln_f(x.float()).to(x.dtype)
         logits = self.lm_head(x)
 
         loss = None
         if targets is not None:
+            # logits 转 fp32 再算 cross_entropy，防止 bf16 下 log_softmax 溢出为 NaN
             loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)),
+                logits.float().view(-1, logits.size(-1)),
                 targets.view(-1)
             )
         return logits, loss
@@ -446,7 +448,7 @@ def evaluate(model, val_loader, accelerator, val_steps, use_xla_sync=False):
         import torch_xla
         torch_xla.sync()
 
-    local_mean = torch.stack(losses).mean()
+    local_mean = torch.stack(losses).float().mean()
     global_mean = accelerator.gather(local_mean).mean().item()
 
     model.train()
@@ -470,7 +472,7 @@ def generate_samples(model, enc, accelerator, step):
                 logits, _ = model(xgen)
 
             logits = logits[:, -1, :]
-            probs = F.softmax(logits, dim=-1)
+            probs = F.softmax(logits.float(), dim=-1)
             topk_probs, topk_indices = torch.topk(probs, SAMPLE_TOPK, dim=-1)
             ix = torch.multinomial(topk_probs, 1)
             xcol = torch.gather(topk_indices, -1, ix)
@@ -682,6 +684,12 @@ def train_worker():
             tpu_print(f"⚠️ load_state_dict 缺失的 key: {missing}")
         if unexpected:
             tpu_print(f"⚠️ load_state_dict 多余的 key: {unexpected}")
+
+        # 确保所有参数为 fp32（checkpoint 可能是 bf16 保存的）
+        for name, param in model.named_parameters():
+            if param.dtype != torch.float32:
+                tpu_print(f"⚠️ {name} dtype={param.dtype}，转为 fp32")
+                param.data = param.data.float()
 
         # 验证 weight tying 是否正确恢复（用 torch.equal 比较实际值，data_ptr 在 XLA 上不可靠）
         assert torch.equal(model.lm_head.weight, model.transformer.wte.weight), \
