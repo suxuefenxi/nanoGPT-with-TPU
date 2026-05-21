@@ -32,7 +32,7 @@ SEED = 1337
 
 # 训练 batch 配置
 TOTAL_BATCH_SIZE = 524288   # 全局 token batch
-MICRO_BATCH_SIZE = 4       # 调小以避免 TPU HBM 溢出
+MICRO_BATCH_SIZE = 32       # 调小以避免 TPU HBM 溢出
 SEQ_LEN = 1024
 
 # 模型配置
@@ -434,12 +434,13 @@ def evaluate(model, val_loader, accelerator, val_steps, use_xla_sync=False):
         with accelerator.autocast():
             _, loss = model(x, y)
 
-        losses.append(loss.detach())
+        # TPU 上每步强制同步：立即执行当前步的计算图，物化 loss 值，
+        # 释放 logits (B, T, vocab_size) 等大中间张量，防止多步累积导致 OOM
+        if use_xla_sync:
+            import torch_xla
+            torch_xla.sync()
 
-    # 只在最后同步一次
-    if use_xla_sync:
-        import torch_xla
-        torch_xla.sync()
+        losses.append(loss.detach())
 
     local_mean = torch.stack(losses).float().mean()
     global_mean = accelerator.gather(local_mean).mean().item()
