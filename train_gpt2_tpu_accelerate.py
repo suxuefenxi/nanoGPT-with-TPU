@@ -52,11 +52,11 @@ GRAD_CLIP = 1.0
 MAX_LR = 6e-4
 MIN_LR = MAX_LR * 0.1
 WARMUP_STEPS = 715
-MAX_STEPS = 10000        # 分次跑：第一次跑 10000 步，之后接着跑
+MAX_STEPS = 19073        
 LR_DECAY_STEPS = 19073   # 学习率衰减目标步数，和 MAX_STEPS 解耦，保证按总步数衰减
 
 # 验证 / 保存
-VAL_INTERVAL = 500
+VAL_INTERVAL = 1000
 VAL_STEPS = 20
 SAVE_BEST_ONLY_WHEN_IMPROVED = True
 
@@ -552,8 +552,18 @@ def train_worker():
 
     ensure_dir(OUT_DIR)
 
+    # 梯度累积步数必须在 Accelerator 构造前算出，作为参数传入
+    # accumulate() 上下文管理器依赖此值决定何时做梯度同步
+    world_size = TPU_NUM_PROCESSES
+    assert TOTAL_BATCH_SIZE % (MICRO_BATCH_SIZE * SEQ_LEN * world_size) == 0, (
+        f"TOTAL_BATCH_SIZE={TOTAL_BATCH_SIZE} must be divisible by "
+        f"MICRO_BATCH_SIZE*SEQ_LEN*world_size = {MICRO_BATCH_SIZE * SEQ_LEN * world_size}"
+    )
+    grad_accum_steps = TOTAL_BATCH_SIZE // (MICRO_BATCH_SIZE * SEQ_LEN * world_size)
+
     accelerator = Accelerator(
         mixed_precision=MIXED_PRECISION,
+        gradient_accumulation_steps=grad_accum_steps,
     )
 
     use_xla_sync = accelerator.device.type == "xla"
@@ -568,12 +578,6 @@ def train_worker():
 
     world_size = accelerator.num_processes
     device = accelerator.device
-
-    assert TOTAL_BATCH_SIZE % (MICRO_BATCH_SIZE * SEQ_LEN * world_size) == 0, (
-        f"TOTAL_BATCH_SIZE={TOTAL_BATCH_SIZE} must be divisible by "
-        f"MICRO_BATCH_SIZE*SEQ_LEN*world_size = {MICRO_BATCH_SIZE * SEQ_LEN * world_size}"
-    )
-    grad_accum_steps = TOTAL_BATCH_SIZE // (MICRO_BATCH_SIZE * SEQ_LEN * world_size)
 
     tpu_print(f"device = {device}")
     tpu_print(f"world_size = {world_size}")
@@ -803,6 +807,8 @@ def train_worker():
             accelerator.wait_for_everyone()
 
         # train one optimizer step
+        # 使用 accumulate 上下文管理器：前 N-1 步跳过梯度同步（all-reduce），最后一步才同步
+        # 比手动调用 accelerator.backward() 少 N-1 次 all-reduce 通信
         model.train()
         optimizer.zero_grad(set_to_none=True)
 
@@ -812,23 +818,25 @@ def train_worker():
         for group in optimizer.param_groups:
             group["lr"] = lr
 
-        for micro_step in range(grad_accum_steps):
-            x, y = train_loader.next_batch()
-            x = x.to(device)
-            y = y.to(device)
+        with accelerator.accumulate(model):
+            for micro_step in range(grad_accum_steps):
+                x, y = train_loader.next_batch()
+                x = x.to(device)
+                y = y.to(device)
 
-            with accelerator.autocast():
-                _, loss = model(x, y)
+                with accelerator.autocast():
+                    _, loss = model(x, y)
 
-            loss_accum += loss.detach() / grad_accum_steps
-            accelerator.backward(loss / grad_accum_steps)  
+                loss_accum += loss.detach() / grad_accum_steps
+                # accumulate 上下文会自动处理 loss 缩放和梯度同步时机
+                accelerator.backward(loss)
 
-        grad_norm = None
-        if GRAD_CLIP is not None and GRAD_CLIP > 0:
-            grad_norm = accelerator.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+            grad_norm = None
+            if GRAD_CLIP is not None and GRAD_CLIP > 0:
+                grad_norm = accelerator.clip_grad_norm_(model.parameters(), GRAD_CLIP)
 
-        optimizer.step()
-        optimizer.zero_grad(set_to_none=True)
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
 
         if use_xla_sync:
             import torch_xla
