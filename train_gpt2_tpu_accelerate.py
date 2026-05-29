@@ -4,17 +4,13 @@ os.environ['XLA_TENSOR_ALLOCATOR_MAXSIZE'] = '100000000'
 
 import math
 import time
-import inspect
 from dataclasses import dataclass, asdict
-from contextlib import nullcontext
-
 import numpy as np
 import tiktoken
 import torch
 import torch.nn as nn
 import torch.distributed as dist
 from torch.nn import functional as F
-
 from accelerate import Accelerator, notebook_launcher
 from accelerate.utils import set_seed
 
@@ -23,7 +19,7 @@ from accelerate.utils import set_seed
 # Global Config
 # ============================================================
 
-DATA_ROOT = "/kaggle/input/datasets/zhxlidf/edu-fineweb10b"  
+DATA_ROOT = "/kaggle/input/your-dataset/edu-fineweb10b"  # 改成你的语料的路径
 OUT_DIR = "out"
 BEST_CKPT_NAME = "best_ckpt.pt"
 FINAL_CKPT_NAME = "final_ckpt.pt"
@@ -32,7 +28,7 @@ SEED = 1337
 
 # 训练 batch 配置
 TOTAL_BATCH_SIZE = 524288   # 全局 token batch
-MICRO_BATCH_SIZE = 32       # 调小以避免 TPU HBM 溢出
+MICRO_BATCH_SIZE = 32       # 调小以避免 TPU HBM 溢出，32是一个合适的取值
 SEQ_LEN = 1024
 
 # 模型配置
@@ -81,11 +77,12 @@ USE_TORCH_COMPILE = False  # TPU 不建议开
 # TPU 上默认走手写 causal attention，不走 flash / fused / cuda sdpa 快路径
 USE_SDPA = True
 
-# wandb
+# wandb（实则swanlab）
 WANDB_ENABLED = True
 WANDB_PROJECT = "nanogpt-tpu"
 WANDB_RUN_NAME = "nanogpt-kaggle-tpuv5e-8"
 from kaggle_secrets import UserSecretsClient
+# 这里导入你的swanlab的api，需要先在kaggle的add-ons，点击secrets设置
 try:
     user_secrets = UserSecretsClient()
     SWANLAB_API_KEY = user_secrets.get_secret("SWANLAB_API_KEY")
@@ -94,7 +91,7 @@ except Exception as e:
     SWANLAB_API_KEY = None
 
 # resume
-RESUME_PATH = None  # 例如 "out/final_ckpt.pt"
+RESUME_PATH = None  # 设置检查点路径会从那里继续训练，例如 "out/final_ckpt.pt"
 
 
 # ============================================================
@@ -260,14 +257,13 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_head, head_dim).transpose(1, 2)
 
-        # QK-Norm（fp32 以防 bf16 方差计算 catastrophic cancellation）
+        # QK-Norm
         q = self.q_norm(q.float()).to(q.dtype)
         k = self.k_norm(k.float()).to(k.dtype)
 
         # RoPE + Attention（全路径 fp32）
-        # q/k/v 转 fp32：RoPE 小角度精度、softmax exp 溢出都需要 fp32
-        cos = self.cos_cached[:T].unsqueeze(0).unsqueeze(0)  # (1, 1, T, head_dim) fp32
-        sin = self.sin_cached[:T].unsqueeze(0).unsqueeze(0)  # fp32
+        cos = self.cos_cached[:T].unsqueeze(0).unsqueeze(0)  # (1, 1, T, head_dim) 
+        sin = self.sin_cached[:T].unsqueeze(0).unsqueeze(0)  
         q = q.float()
         k = k.float()
         v = v.float()
@@ -284,7 +280,7 @@ class CausalSelfAttention(nn.Module):
             y = att @ v
 
         y = y.transpose(1, 2).contiguous().view(B, T, C)
-        y = self.c_proj(y)  # autocast 自动处理 bf16 转换
+        y = self.c_proj(y) 
         return y
 
 
@@ -405,7 +401,6 @@ class GPT(nn.Module):
             print(f"num decayed tensors: {len(decay_params)} | params: {num_decay_params:,}", flush=True)
             print(f"num non-decayed tensors: {len(nodecay_params)} | params: {num_nodecay_params:,}", flush=True)
 
-        # TPU / XLA 不用 fused AdamW
         optimizer = torch.optim.AdamW(
             optim_groups,
             lr=learning_rate,
@@ -497,20 +492,7 @@ def save_checkpoint(
 ):
     accelerator.wait_for_everyone()
 
-    # 🚨 终极死锁神坑修复：不要手动循环调用 .cpu() 转换 XLA 张量
-    # 直接使用 accelerator.get_state_dict() 获取模型状态
-    # 并且直接获取 optimizer.state_dict()，交由 accelerator.save 统一安全处理
     state_dict = accelerator.get_state_dict(model)
-
-    # 诊断：检查 state_dict 情况（无 lm_head，只保留 wte）
-    if accelerator.process_index == 0:
-        print(f"[save] get_state_dict 返回 {len(state_dict)} 个 keys", flush=True)
-        if 'transformer.wte.weight' in state_dict:
-            print(f"[save] wte.std()={state_dict['transformer.wte.weight'].float().std().item():.6f}", flush=True)
-
-    # 兼容旧 checkpoint：如果 state_dict 里意外出现 lm_head.weight，移除之
-    if 'lm_head.weight' in state_dict:
-        del state_dict['lm_head.weight']
     opt_state = optimizer.state_dict()
 
     ckpt = {
@@ -575,8 +557,6 @@ def train_worker():
 
     process_seed = SEED + accelerator.process_index
     set_seed(process_seed)
-
-    world_size = accelerator.num_processes
     device = accelerator.device
 
     tpu_print(f"device = {device}")
@@ -662,11 +642,6 @@ def train_worker():
             for k in list(state_dict.keys()):
                 if k.startswith(prefix):
                     state_dict[k[len(prefix):]] = state_dict.pop(k)
-
-        # 兼容旧 checkpoint：旧版模型有 lm_head.weight，新版已移除，直接删掉
-        if 'lm_head.weight' in state_dict:
-            del state_dict['lm_head.weight']
-            tpu_print("🔧 已移除旧 checkpoint 中的 lm_head.weight（新版用 F.linear + wte.weight）")
 
         missing, unexpected = model.load_state_dict(state_dict, strict=False)
         if missing:
@@ -802,7 +777,7 @@ def train_worker():
         # sample
         if DO_SAMPLE and ((step > 0 and step % SAMPLE_INTERVAL == 0) or last_step):
             accelerator.wait_for_everyone()
-            # 🚨 TPU 死锁大坑修复 2：XLA 的计算图要求多卡同步。所有设备都必须参与 generate 运算进行占位，绝不能 `if rank == 0:` 单独执行
+            # TPU 死锁大坑修复：XLA 的计算图要求多卡同步。所有设备都必须参与 generate 运算进行占位，绝不能 `if rank == 0:` 单独执行
             generate_samples(raw_model, enc, accelerator, step)
             accelerator.wait_for_everyone()
 
