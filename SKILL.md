@@ -205,6 +205,8 @@ TPU 原生支持 bf16（Brain Float 16），不支持 fp16 的快速运算。bf1
 - 与 fp32 相同的指数位（8 位），动态范围大，不容易溢出
 - 尾数位较少（7 位 vs fp32 的 23 位），精度略低
 
+**正确开启 bf16 的方式只有一种**：用 Accelerate 的 `mixed_precision="bf16"`（autocast 混合精度）。**绝对不要**用 `XLA_USE_BF16=1` 全局开关，它是导致训练 NaN 的头号元凶，详见 [4.4 节](#44-永远不要用-xla_use_bf16-全局开关实战教训)。
+
 ### 4.2 必须强制 fp32 的关键路径
 
 bf16 精度不够的地方会产生 NaN。以下路径**必须手动转 fp32**：
@@ -231,9 +233,14 @@ loss = F.cross_entropy(logits.view(-1, vocab_size), targets.view(-1))
 loss = F.cross_entropy(logits.float().view(-1, vocab_size), targets.view(-1))
 ```
 
-### 4.3 QK-Norm：防止 Attention Logit 爆炸
+### 4.3 QK-Norm：可选的防御手段（非必须）
 
-除了手动 fp32，还可以加 QK-Norm 从根本上防止 attention logit 数值过大：
+QK-Norm 能抑制 attention logit 数值过大，但**它不是训练稳定性的必需品**。实测证明：只要混合精度姿势正确（Accelerate autocast + 4.2 节的关键路径 fp32 保护），即使完全去掉 QK-Norm，1.23 亿参数规模的模型也能稳定训练上万步不出 NaN。
+
+它的真实定位是**防御性保险**：对抗训练过程中 attention logits 缓慢增大的现象（logit drift，已知现象），在低精度环境下能更早避免 softmax 溢出。建议：
+
+- 想简化模型 → 可以去掉，但**必须保留 4.2 节的 fp32 保护**
+- 追求稳健（尤其是更大模型、更长训练）→ 建议保留：
 
 ```python
 self.q_norm = nn.LayerNorm(head_dim)
@@ -243,6 +250,28 @@ self.k_norm = nn.LayerNorm(head_dim)
 q = self.q_norm(q.float()).to(q.dtype)
 k = self.k_norm(k.float()).to(k.dtype)
 ```
+
+### 4.4 永远不要用 XLA_USE_BF16 全局开关（实战教训）
+
+```python
+# ❌ 致命：强制所有浮点张量为 bf16（包括参数、梯度、优化器状态）
+os.environ['XLA_USE_BF16'] = '1'
+
+# ✅ 正确：用 Accelerate autocast 开启混合精度（fp32 主权重 + bf16 计算）
+accelerator = Accelerator(mixed_precision="bf16")
+```
+
+两者的本质区别：
+
+| 模式 | `XLA_USE_BF16=1`（❌） | Accelerate autocast（✅） |
+|------|----------------------|--------------------------|
+| 参数 / 梯度 | bf16 | fp32（master weights） |
+| 优化器状态（AdamW 动量） | **bf16，精度严重受损** | fp32 |
+| 手动 `.float()` 保护 | 被失效（强制降回 bf16） | 有效 |
+| 结果 | 收敛变慢、误差累积、NaN 崩溃 | 数值稳定 |
+
+**实战教训**：本项目早期复现时设置了 `XLA_USE_BF16=1` 且敏感路径无 fp32 保护，训练严重退化（6000 步 loss 仍停留在 ~6.3，而正确姿势同期约 3.5），并在第 6056 步突然全面 NaN 崩溃。根因：AdamW 优化器状态被降级为 bf16 后，动量累积的舍入误差使自适应学习率逐渐失真；同时 LayerNorm 方差、cross_entropy 的 log_softmax、softmax 等敏感路径毫无保护，误差累积到某一步单点溢出，NaN 经梯度污染全部参数。
+**记住**：混合精度的“混合”靠的是 fp32 主权重和 fp32 优化器状态；`XLA_USE_BF16=1` 会把“混合精度”变成“全链路低精度”。
 
 ---
 
@@ -818,7 +847,9 @@ launch()
 
 **原因**：bf16 精度不够，LayerNorm / softmax / cross_entropy 中出现数值溢出。
 
-**解决**：参考[第 4.2 节](#42-必须强制-fp32-的关键路径)，在关键路径强制 fp32。
+**解决**：
+1. 首先检查是否设置了 `XLA_USE_BF16=1`，有则立即删除（见 [4.4 节](#44-永远不要用-xla_use_bf16-全局开关实战教训)，它会使所有 fp32 保护失效）
+2. 参考[第 4.2 节](#42-必须强制-fp32-的关键路径)，在关键路径强制 fp32
 
 ### 13.4 OOM（Out of Memory）
 
